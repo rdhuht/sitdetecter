@@ -6,7 +6,7 @@
 
 > 📦 **本仓库包含两个版本**,都在 `main` 分支上:
 > - **根目录**(本 README):**v1.0.0 单机版**——micro:bit 独立工作,所有显示在 LED 上
-> - **[`v2/` 目录](./v2/README.md)**:**v2.0.0 蓝牙版**——micro:bit 通过 BLE 同步状态到 Chrome 扩展
+> - **[`bluetooth/` 目录](./bluetooth/README.md)**:**v2.0.0 蓝牙版**——micro:bit 通过 BLE 同步状态到 Chrome 扩展
 >
 
 ---

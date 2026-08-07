@@ -11,7 +11,7 @@ VERSION = "2.0.0"
 EDITION = "蓝牙版"
 
 from microbit import (
-    pin0,
+    pin1,
     button_a,
     button_b,
     display,
@@ -37,7 +37,9 @@ COOLDOWN_RATIO = 0.2
 SAMPLE_MS = 100                 # 主循环周期（毫秒）—— 10 Hz,确保 1 Hz 闪烁可见
 DEBOUNCE_COUNT = 2              # 去抖：连续 N 次采样一致才认定状态改变
 WALK_FRAME_MS = 200             # 走路动画每帧切换间隔
-BLE_PUSH_MS = 1000              # BLE 状态推送间隔（毫秒）
+LEAVE_TOLERANCE_MS = 30000      # 短暂离开容差:30 秒内回来算还在坐,累加计时接续
+                                # 超过 30 秒才认为真的离开,清空 sit_start_ms
+BLE_PUSH_MS = 1000              # BLE 状态推送间隔(毫秒)
 
 # ============== BLE 协议 ==============
 # 自定义 Nordic UART-like Service: 1 个 TX characteristic (notify) + 1 个 RX characteristic (write)
@@ -69,6 +71,8 @@ sit_start_ms = None             # 本次坐下起始时刻
 last_warn_ms = None             # 上次大叉提醒时刻
 stand_start_ms = None           # 用户站起来(开始冷却)的时刻
 actual_sit_ms = None            # 本次坐下实际坐的总时长(用于计算冷却 = 实际坐 × 20%)
+leave_start_ms = None           # 短暂离开的开始时刻;超过 LEAVE_TOLERANCE_MS 才视为真离开
+frozen_elapsed_ms = None        # 短暂离开时的进度快照(已坐多久);离开期间保持不变
 raw_state = 0                   # 当前原始读数 (0=无人, 1=有人)
 stable_state = 0                # 去抖后的稳定状态
 same_count = 0                  # 连续相同采样次数
@@ -91,9 +95,11 @@ def get_threshold():
 
 def reset_progress():
     """坐下或离开时清空计时状态。"""
-    global sit_start_ms, last_warn_ms
+    global sit_start_ms, last_warn_ms, leave_start_ms, frozen_elapsed_ms
     sit_start_ms = None
     last_warn_ms = None
+    leave_start_ms = None
+    frozen_elapsed_ms = None
 
 
 def reset_cooldown():
@@ -130,6 +136,7 @@ def draw_progress(now_ms, elapsed_ms, total_ms):
     - 闪烁结束后立刻转常亮,作为累计进度
     - 任意时刻只有 1 颗正在闪烁,之前完成的常亮,未开始的灭
     - 填充方向:从下往上、每行从左到右(LED_FILL_ORDER)
+    - 闪烁相位取墙钟 now_ms,所以短暂离开冻结进度时当前那颗 LED 仍按 1 Hz 闪烁
     """
     if elapsed_ms >= total_ms:
         for x, y in LED_FILL_ORDER:
@@ -138,7 +145,7 @@ def draw_progress(now_ms, elapsed_ms, total_ms):
 
     per_led_ms = total_ms // TOTAL_LEDS
     led_idx = elapsed_ms // per_led_ms
-    flicker_on = ((elapsed_ms // 500) % 2) == 0
+    flicker_on = ((now_ms // 500) % 2) == 0
 
     for i, (x, y) in enumerate(LED_FILL_ORDER):
         if i < led_idx:
@@ -257,7 +264,7 @@ def maybe_push_ble_state(occupied, now):
 
 
 # ============== 初始化 ==============
-pin0.set_pull(pin0.PULL_DOWN)
+pin1.set_pull(pin1.PULL_DOWN)
 init_ble()
 display.show(Image.YES)
 sleep(500)
@@ -272,7 +279,7 @@ while True:
     threshold_ms = threshold_min * 60 * 1000
 
     # 读取引脚并去抖
-    sample = 1 if pin0.read_digital() == 1 else 0
+    sample = 1 if pin1.read_digital() == 1 else 0
     if sample == raw_state:
         same_count += 1
     else:
@@ -301,7 +308,13 @@ while True:
         # 用户坐下
         reset_cooldown()    # 坐下立即取消冷却状态
         if sit_start_ms is None:
+            # 首次坐下 OR 真离开后重新坐下 → 重新开始计时
             sit_start_ms = now
+        elif leave_start_ms is not None:
+            # 短暂离开后回来 → 把离开时长补偿掉,保持累计计时连续
+            pause_ms = now - leave_start_ms
+            sit_start_ms += pause_ms
+            leave_start_ms = None
 
         elapsed_ms = now - sit_start_ms
 
@@ -322,21 +335,43 @@ while True:
             draw_progress(now, elapsed_ms, threshold_ms)
     else:
         # 无人坐
-        # 只有"超时后站起来"才进入冷却期(走路动画);
-        # 未超时就短暂离开,直接清屏等待用户回来,不走冷却流程
+        # 区分"短暂离开"(容差内)和"真离开"
+        # - 未超时 + 短暂离开:画面冻在离开瞬间,等用户回来接续
+        # - 已超时 + 任何离开:立即进冷却,显示走路动画
+        #   (只要人起来了,就不再纠缠他,让他走起来休息)
+        # - 真离开:走原有 reset_progress / 冷却流程
         if sit_start_ms is not None or last_warn_ms is not None:
             had_timed_out = last_warn_ms is not None
-            # 记录本次实际坐的总时长(坐下到站起的总时间,含超时部分)
-            if sit_start_ms is not None:
-                actual_sit_ms = now - sit_start_ms
-            reset_progress()
-            if had_timed_out and stand_start_ms is None:
-                # 超时后才站起来 → 进入冷却(时长 = 实际坐的时长 × 20%)
-                stand_start_ms = now
-            elif not had_timed_out:
-                # 未超时就离开 → 不进入冷却
-                reset_cooldown()
-            display.clear()
+            leave_dur = None
+            if sit_start_ms is not None and leave_start_ms is None:
+                # 刚从坐下进入离开状态:记下离开起点,顺便冻结当前已坐时长
+                # (只对未超时场景有意义;已超时场景立刻走冷却,稍后会被真离开分支清掉)
+                leave_start_ms = now
+                if not had_timed_out:
+                    frozen_elapsed_ms = now - sit_start_ms
+            if leave_start_ms is not None:
+                leave_dur = now - leave_start_ms
+
+            # 已超时 → 不走短暂离开,立刻当真离开处理(进冷却)
+            is_short = (
+                not had_timed_out
+                and leave_dur is not None
+                and leave_dur < LEAVE_TOLERANCE_MS
+            )
+
+            if is_short:
+                # 未超时 + 短暂离开:用冻结的 elapsed,画面"冻在"离开瞬间那颗 LED
+                draw_progress(now, frozen_elapsed_ms, threshold_ms)
+            else:
+                # 真离开(含已超时后任何站起):走原有清理 + 冷却流程
+                if sit_start_ms is not None:
+                    actual_sit_ms = now - sit_start_ms
+                reset_progress()
+                if had_timed_out and stand_start_ms is None:
+                    stand_start_ms = now
+                elif not had_timed_out:
+                    reset_cooldown()
+                display.clear()
 
         if stand_start_ms is not None:
             cooldown_ms = now - stand_start_ms

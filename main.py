@@ -75,6 +75,34 @@ def reset_cooldown():
     actual_sit_ms = None
 
 
+def plot_bar_graph(value, high):
+    """类似 MakeCode 的 plot-bar-graph:
+    按 value/high 比例在 5x5 LED 上画一根从底部向上填充的柱状图,
+    填充顺序沿用 LED_FILL_ORDER(从下往上、左到右)。
+    任何超过 high 的值都被截断为 high。
+
+    - 当前正在填充的那一颗 LED 按 1 Hz 闪烁(墙钟驱动,刷新由调用方负责)
+    - 已经填满的常亮,未到的不亮
+    - 比例 0 时全部熄灭(便于初始化/重置场景)
+    """
+    if high <= 0:
+        return
+
+    clamped = value if 0 <= value <= high else (high if value > high else 0)
+    now_ms = running_time()
+    lit_count = (clamped * TOTAL_LEDS) // high  # 已经填满的 LED 数
+    remainder = (clamped * TOTAL_LEDS) % high   # 当前正在闪烁的那颗 LED 的填充进度
+    flicker_on = ((now_ms // 500) % 2) == 0
+
+    for i, (x, y) in enumerate(LED_FILL_ORDER):
+        if i < lit_count:
+            display.set_pixel(x, y, 9)
+        elif i == lit_count and remainder > 0:
+            display.set_pixel(x, y, 9 if flicker_on else 0)
+        else:
+            display.set_pixel(x, y, 0)
+
+
 def draw_progress(now_ms, elapsed_ms, total_ms):
     """画接力式均匀闪烁进度条:
     - 总时长 total_ms 平均分配给 25 颗 LED,每颗分到 per_led_ms = total_ms // 25 毫秒

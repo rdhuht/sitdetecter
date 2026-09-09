@@ -1,26 +1,31 @@
 # sitdetecter - 久坐提醒器 (MicroPython for micro:bit)
-# 版本:v1.0.0(单机版)
 # 硬件：薄膜压力座椅传感器 (DJ7021-5.3-11, 常开型)
 # 接线：传感器红线 → 3.3V，黑线 → P1；P1 启用内部下拉电阻
-# 按键：A 键循环切换阈值（15/30/45/60 分钟），B 键手动重置
+# 开机：开机时有一次机会确认音量，A切换音量，B确认
+# 按键：A 键循环切换阈值（0.1/15/30/45/60分钟），B 键手动重置
 # 显示：5x5 LED 接力式进度条（总时长均分到 25 颗，每颗持续闪烁 N 次后转常亮）+ 超时骷髅闪烁 + 站立后小人走路动画
 
 # 版本号(语义化版本 SemVer:主版本.次版本.修订号)
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 EDITION = "单机版"
 
-from microbit import (
-    pin1,
-    button_a,
-    button_b,
-    display,
-    Image,
-    running_time,
-    sleep,
-)
+from microbit import *
+import music
+
+# ============== 初始化 ==============
+pin1.set_pull(pin1.PULL_DOWN)
+
+# ============== 提醒声音 ==============
+"""
+music库: https://pc-microbit-micropython.readthedocs.io/en/latest/sounds/music.html
+"""
+VOLUME_THRESHOLDS = [0, 50, 100, 150, 200, 250]   # 音量，按键A+B切换
+RESET_PROGRESS_MUSIC = music.BA_DING # 坐下或离开时清空计时状态时播放的音乐
+ALERT_MUSIC = music.POWER_DOWN # 到时间后的警报声音 打岔X三次，播放三次
+SKULL_FRE = 440 # 骷髅警报频率
 
 # ============== 配置 ==============
-THRESHOLDS = [15, 30, 45, 60]   # 久坐阈值档位（分钟），按 A 键循环切换
+THRESHOLDS = [0.1, 15, 30, 45, 60]   # 久坐阈值档位（分钟），按 A 键循环切换
 WARN_REPEAT_MIN = 5             # 超时后每 N 分钟再叠加一次 X + 箭头
 # 冷却时长 = 实际坐的时长 × COOLDOWN_RATIO(默认 20%)
 # 阈值 45 分钟准时站起 → 冷却 9 分钟;坐 60 分钟才起 → 冷却 12 分钟
@@ -36,7 +41,8 @@ LED_FILL_ORDER = [(x, y) for y in range(4, -1, -1) for x in range(5)]
 TOTAL_LEDS = 25
 
 # ============== 状态 ==============
-config_idx = 2                  # 默认 45 分钟(THRESHOLDS 索引 2)
+config_idx = 0                  # 默认6秒钟(THRESHOLDS 索引 0)
+volume_config_idx = 0           # 默认音量0(VOLUME_THRESHOLDS 索引 0)
 sit_start_ms = None             # 本次坐下起始时刻
 last_warn_ms = None             # 上次大叉提醒时刻
 stand_start_ms = None           # 用户站起来(开始冷却)的时刻
@@ -59,6 +65,10 @@ def get_threshold():
     return THRESHOLDS[config_idx]
 
 
+def get_volume_threshold():
+    return VOLUME_THRESHOLDS[volume_config_idx]
+
+
 def reset_progress():
     """坐下或离开时清空计时状态。"""
     global sit_start_ms, last_warn_ms, leave_start_ms, frozen_elapsed_ms
@@ -66,6 +76,7 @@ def reset_progress():
     last_warn_ms = None
     leave_start_ms = None
     frozen_elapsed_ms = None
+    music.play(RESET_PROGRESS_MUSIC)
 
 
 def reset_cooldown():
@@ -80,14 +91,13 @@ def plot_bar_graph(value, high):
     按 value/high 比例在 5x5 LED 上画一根从底部向上填充的柱状图,
     填充顺序沿用 LED_FILL_ORDER(从下往上、左到右)。
     任何超过 high 的值都被截断为 high。
-
     - 当前正在填充的那一颗 LED 按 1 Hz 闪烁(墙钟驱动,刷新由调用方负责)
     - 已经填满的常亮,未到的不亮
     - 比例 0 时全部熄灭(便于初始化/重置场景)
     """
     if high <= 0:
         return
-
+ 
     clamped = value if 0 <= value <= high else (high if value > high else 0)
     now_ms = running_time()
     lit_count = (clamped * TOTAL_LEDS) // high  # 已经填满的 LED 数
@@ -130,21 +140,14 @@ def draw_progress(now_ms, elapsed_ms, total_ms):
             display.set_pixel(x, y, 0)
 
 
-def draw_skull_blink(now_ms):
-    """超时持续阶段:全屏骷髅 1 Hz 闪烁。"""
-    phase_on = ((now_ms // 500) % 2) == 0
-    if phase_on:
-        display.show(Image.SKULL)
-    else:
-        display.clear()
-
-
 def flash_alert():
-    """大叉 X 闪 3 次 + 箭头 1 次,期间 alerting=True 阻止其他画图干扰。"""
+    """大叉 X 闪 3 次 + 箭头 1 次 + 上行提示音,期间 alerting=True 阻止其他画图干扰。"""
     global alerting
     alerting = True
+    # 在 X 开始前先响一声,把人从 LED 闪屏中"叫"过来
     for _ in range(3):
         display.show(Image.NO)
+        music.play(ALERT_MUSIC)
         sleep(300)
         display.clear()
         sleep(200)
@@ -154,19 +157,35 @@ def flash_alert():
     alerting = False
 
 
+def draw_skull_blink(now_ms):
+    """超时持续阶段:全屏骷髅 1 Hz 闪烁。"""
+    phase_on = ((now_ms // 500) % 2) == 0
+    if phase_on:
+        display.show(Image.SKULL)
+        music.pitch(SKULL_FRE)
+    else:
+        display.clear()
+        music.stop()
+
+
 def draw_walk_anim(now_ms):
     """小人走路动画:两帧交替,每 WALK_FRAME_MS 切一次。"""
     idx = (now_ms // WALK_FRAME_MS) % WALK_FRAME_COUNT
     display.show(WALK_FRAMES[idx])
 
 
-# ============== 初始化 ==============
-pin1.set_pull(pin1.PULL_DOWN)
-display.show(Image.YES)
-sleep(500)
-display.clear()
-display.scroll(str(get_threshold()))
-
+# ============== 开机设置音量 ==============
+while True:
+    # A键控制音量切换
+    if button_a.was_pressed():
+        volume_config_idx = (volume_config_idx + 1) % len(VOLUME_THRESHOLDS)
+        volume = VOLUME_THRESHOLDS[volume_config_idx]
+        set_volume(volume)
+        plot_bar_graph(volume, 250)
+        music.play(RESET_PROGRESS_MUSIC)
+    # B键跳出音量调节
+    if button_b.was_pressed():
+        break
 
 # ============== 主循环 ==============
 while True:
@@ -202,6 +221,7 @@ while True:
         # 滚动显示当前挡位,让用户确认选中哪个阈值
         display.scroll(str(get_threshold()), delay=80)
         display.clear()
+
 
     # 大叉期间不画图,让 X 完整闪完
     if occupied and alerting:
